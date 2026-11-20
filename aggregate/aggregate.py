@@ -135,10 +135,12 @@ def aggregate(servers, results, now):
                 d = day(r.get("day"))
                 if not d:
                     continue
-                a = agg["daily"].setdefault(d, {"per_server": {}, "requests": 0,
-                                                "bytes": 0})
+                a = agg["daily"].setdefault(d, {"per_server": {}, "bytes_per_server": {},
+                                                "requests": 0, "bytes": 0})
                 a["per_server"][srv["id"]] = (a["per_server"].get(srv["id"], 0)
                                               + num(r.get("fetches")))
+                a["bytes_per_server"][srv["id"]] = (
+                    a["bytes_per_server"].get(srv["id"], 0) + num(r.get("bytes")))
                 a["requests"] += num(r.get("requests"))
                 a["bytes"] += num(r.get("bytes"))
             cutoff = (now.date() - dt.timedelta(days=30)).isoformat()
@@ -159,8 +161,11 @@ def aggregate(servers, results, now):
                              {m: r.get(m) for m in
                               ("networks", "requests", "bytes")})
             for r in rows(st.get("tools")):
-                t = agg["tools"].setdefault(s(r.get("tool")), {"versions": 0})
+                t = agg["tools"].setdefault(s(r.get("tool")),
+                                            {"versions": 0, "fetches_30d_per_server": {}})
                 t["versions"] = max(t["versions"], num(r.get("versions")))
+                ps = t["fetches_30d_per_server"]
+                ps[srv["id"]] = ps.get(srv["id"], 0) + num(r.get("fetches_30d"))
                 add_into(agg["tools"], s(r.get("tool")),
                          {m: r.get(m) for m in ("fetches_30d", "networks_30d",
                                                 "fetches_365d", "networks_365d")})
@@ -191,6 +196,7 @@ def aggregate(servers, results, now):
         "min_networks_per_group": k,
         "servers": status,
         "daily": [{"day": d, "fetches_per_server": v["per_server"],
+                   "bytes_per_server": v["bytes_per_server"],
                    "fetches": sum(v["per_server"].values()),
                    "requests": v["requests"], "bytes": v["bytes"]}
                   for d, v in sorted(agg["daily"].items())],
@@ -323,12 +329,44 @@ def hbar_chart(items, fmt, label):
             % (e(label), "".join(out)))
 
 
+def stacked_hbar_chart(items, series, fmt, label):
+    """Horizontal bars stacked by series (same slots/legend as the column charts).
+    items: [(label, {series_id: value})]; series: [(id, label, slot)]"""
+    if not items:
+        return "<p class='muted'>No data yet.</p>"
+    totals = [sum(vals.get(sid, 0) for sid, _, _ in series) for _, vals in items]
+    vmax = max(totals) or 1
+    out = []
+    for (lab, vals), tot in zip(items, totals):
+        segs, tip = [], ["<b>%s</b>" % e(lab)]
+        for sid, slabel, slot in series:
+            v = vals.get(sid, 0)
+            if v <= 0:
+                continue
+            tip.append("<span class='sw s%d'></span>%s: %s (%.0f%%)"
+                       % (slot, e(slabel), e(fmt(v)), 100.0 * v / (tot or 1)))
+            segs.append("<span class='hs s%d' style='flex-grow:%d'></span>" % (slot, v))
+        tip.append("Total: %s" % e(fmt(tot)))
+        out.append(
+            "<div class='hb col' tabindex='0' data-tip=\"%s\">"
+            "<span class='hl'>%s</span>"
+            "<span class='ht'><span class='hf hstack' style='width:%.2f%%'>%s</span></span>"
+            "<span class='hv'>%s</span></div>"
+            % (e("<br>".join(tip)), e(lab), max(100.0 * tot / vmax, 0.4),
+               "".join(segs), e(fmt(tot))))
+    return ("<div class='hbars' role='list' aria-label='%s'>%s</div>"
+            % (e(label), "".join(out)))
+
+
 def render(a, servers):
     k = a["min_networks_per_group"] or 3
     days = a["daily"][-90:]
     sid_slot = {srv["id"]: i % len(SERIES_LIGHT) for i, srv in enumerate(servers)}
     series = [(srv["id"], srv["label"], sid_slot[srv["id"]]) for srv in servers
               if any(d["fetches_per_server"].get(srv["id"]) for d in days)]
+    bseries = [(srv["id"], srv["label"], sid_slot[srv["id"]]) for srv in servers
+               if any(d.get("bytes_per_server", {}).get(srv["id"]) for d in days)]
+    all_series = [(srv["id"], srv["label"], sid_slot[srv["id"]]) for srv in servers]
     last30 = a["daily"][-30:]
     tiles = [
         (fmt_n(sum(d["fetches"] for d in last30)), "container opens, last 30 days"),
@@ -347,14 +385,30 @@ def render(a, servers):
         [("Day", False)] + [(lab, True) for _, lab, _ in series] + [("Total", True)],
         [[e(d["day"])] + [fmt_n(d["fetches_per_server"].get(sid, 0)) for sid, _, _ in series]
          + [fmt_n(d["fetches"])] for d in reversed(days)])
+    blegend = "".join("<span class='li'><span class='sw s%d'></span>%s</span>"
+                      % (slot, e(lab)) for _, lab, slot in bseries)
     bytes_chart = column_chart(
-        days, [("all", "Data served", 0)], lambda d, sid: d["bytes"],
-        fmt_bytes, "Data served per day, all servers", "c-bytes")
-    bytes_table = table([("Day", False), ("Data served", True), ("Requests", True)],
-                        [[e(d["day"]), e(fmt_bytes(d["bytes"])), fmt_n(d["requests"])]
-                         for d in reversed(days)])
-    top_tools = [(t["tool"], t.get("fetches_30d", 0)) for t in a["tools"][:15]
-                 if t.get("fetches_30d")]
+        days, bseries, lambda d, sid: d.get("bytes_per_server", {}).get(sid, 0),
+        fmt_bytes, "Data served per day, stacked by server", "c-bytes")
+    bytes_table = table(
+        [("Day", False)] + [(lab, True) for _, lab, _ in bseries]
+        + [("Total", True), ("Requests", True)],
+        [[e(d["day"])] + [e(fmt_bytes(d.get("bytes_per_server", {}).get(sid, 0)))
+                          for sid, _, _ in bseries]
+         + [e(fmt_bytes(d["bytes"])), fmt_n(d["requests"])] for d in reversed(days)])
+    top = [t for t in a["tools"][:15] if t.get("fetches_30d")]
+    tseries = [x for x in all_series
+               if any(t.get("fetches_30d_per_server", {}).get(x[0]) for t in top)]
+    tlegend = "".join("<span class='li'><span class='sw s%d'></span>%s</span>"
+                      % (slot, e(lab)) for _, lab, slot in tseries)
+    tools_chart = stacked_hbar_chart(
+        [(t["tool"], t.get("fetches_30d_per_server", {})) for t in top], tseries, fmt_n,
+        "Top tools by container opens in the last 30 days, stacked by server")
+    tools_split_table = table(
+        [("Tool", False)] + [(lab, True) for _, lab, _ in tseries] + [("Total", True)],
+        [[e(t["tool"])] + [fmt_n(t.get("fetches_30d_per_server", {}).get(sid, 0))
+                           for sid, _, _ in tseries] + [fmt_n(t.get("fetches_30d", 0))]
+         for t in top])
     cont_bars = [(c["continent"], c.get("bytes", 0)) for c in a["continents_30d"]]
 
     srv_rows = []
@@ -384,8 +438,8 @@ def render(a, servers):
                          fmt_n(c.get("fetches_30d", 0)), fmt_n(c.get("fetches_365d", 0)),
                          fmt_n(c.get("networks_365d", 0)), conts or "–"])
 
-    slot_css = "".join(".s%d{fill:var(--s%d)}.sw.s%d{background:var(--s%d)}"
-                       % (i, i, i, i) for i in range(len(SERIES_LIGHT)))
+    slot_css = "".join(".s%d{fill:var(--s%d)}.sw.s%d,.hs.s%d{background:var(--s%d)}"
+                       % (i, i, i, i, i) for i in range(len(SERIES_LIGHT)))
     light_vars = "".join("--s%d:%s;" % (i, c) for i, c in enumerate(SERIES_LIGHT))
     dark_vars = "".join("--s%d:%s;" % (i, c) for i, c in enumerate(SERIES_DARK))
 
@@ -396,8 +450,8 @@ def render(a, servers):
         tiles="".join("<div class='tile'><b>%s</b><span>%s</span></div>" % (e(v), e(t))
                       for v, t in tiles),
         legend=legend, opens_chart=opens_chart, opens_table=opens_table,
-        bytes_chart=bytes_chart, bytes_table=bytes_table,
-        tools_chart=hbar_chart(top_tools, fmt_n, "Top tools by container opens, last 30 days"),
+        blegend=blegend, bytes_chart=bytes_chart, bytes_table=bytes_table,
+        tlegend=tlegend, tools_chart=tools_chart, tools_split_table=tools_split_table,
         cont_chart=hbar_chart(cont_bars, fmt_bytes, "Data served by continent, last 30 days"),
         servers=table([("Server", False), ("Status", False), ("Last report", False),
                        ("Data since", False), ("Opens 30d", True), ("Requests 30d", True),
@@ -450,7 +504,7 @@ tr:last-child td{{border-bottom:0}}.num{{text-align:right;font-variant-numeric:t
 details{{margin-top:8px}}summary{{cursor:pointer;color:var(--fg2);font-size:13px}}details .tw{{margin-top:8px;max-height:420px;overflow:auto}}
 input{{width:100%;max-width:320px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit;margin-bottom:10px}}
 .st.ok{{color:var(--ok)}}.st.stale{{color:var(--warn)}}.st.unavailable{{color:var(--bad)}}
-.hbars{{display:grid;gap:4px}}.hb{{display:grid;grid-template-columns:minmax(90px,190px) 1fr auto;align-items:center;gap:10px;padding:2px 4px;border-radius:6px}}.hb:hover,.hb:focus-visible{{background:var(--grid);outline:none}}.hl{{text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}}.ht{{height:16px;display:block}}.hf{{display:block;height:100%;background:var(--s0);border-radius:0 4px 4px 0}}.hv{{font-size:12px;color:var(--fg2);font-variant-numeric:tabular-nums;white-space:nowrap}}.cw{{overflow-x:auto}}.cw .chart{{min-width:640px}}
+.hbars{{display:grid;gap:4px}}.hb{{display:grid;grid-template-columns:minmax(90px,190px) 1fr auto;align-items:center;gap:10px;padding:2px 4px;border-radius:6px}}.hb:hover,.hb:focus-visible{{background:var(--grid);outline:none}}.hl{{text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}}.ht{{height:16px;display:block}}.hf{{display:block;height:100%;background:var(--s0);border-radius:0 4px 4px 0}}.hstack{{display:flex;gap:2px;background:none}}.hs{{display:block;height:100%;flex-basis:0;min-width:0}}.hs:first-child{{border-radius:0}}.hs:last-child{{border-radius:0 4px 4px 0}}.hv{{font-size:12px;color:var(--fg2);font-variant-numeric:tabular-nums;white-space:nowrap}}.cw{{overflow-x:auto}}.cw .chart{{min-width:640px}}
 footer{{margin-top:44px;font-size:13px;color:var(--fg2)}}a{{color:var(--s0)}}
 </style></head><body><main>
 <h1>Neurodesk CVMFS usage</h1>
@@ -464,12 +518,14 @@ footer{{margin-top:44px;font-size:13px;color:var(--fg2)}}a{{color:var(--s0)}}
 <details><summary>Show data table</summary>{opens_table}</details></div>
 
 <h2>Data served per day</h2>
-<p class="note">All servers, all object types.</p>
-<div class="card"><div class="cw">{bytes_chart}</div><details><summary>Show data table</summary>{bytes_table}</details></div>
+<p class="note">Last 90 days, all object types, stacked by the Stratum&nbsp;1 server that served them.</p>
+<div class="card"><div class="legend">{blegend}</div><div class="cw">{bytes_chart}</div><details><summary>Show data table</summary>{bytes_table}</details></div>
 
 <h2>Most used tools</h2>
-<p class="note">Container opens in the last 30 days, top 15.</p>
-<div class="card">{tools_chart}</div>
+<p class="note">Container opens in the last 30 days, top 15, split by the Stratum&nbsp;1 server that served them.
+Clients normally use the server closest to them, so the split shows roughly where each tool is used.</p>
+<div class="card"><div class="legend">{tlegend}</div>{tools_chart}
+<details><summary>Show data table</summary>{tools_split_table}</details></div>
 
 <h2>By continent</h2>
 <p class="note">Data served in the last 30 days.</p>
