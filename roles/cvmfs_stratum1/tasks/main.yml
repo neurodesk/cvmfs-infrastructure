@@ -1,0 +1,65 @@
+- name: Install CVMFS release package
+  ansible.builtin.dnf:
+    name: https://cvmrepo.s3.cern.ch/cvmrepo/yum/cvmfs-release-latest.noarch.rpm
+    state: present
+    disable_gpg_check: true   # bootstrap package; it installs the signing key
+
+- name: Install CVMFS server, httpd and mod_wsgi (geo API)
+  ansible.builtin.dnf:
+    name: [cvmfs-server, httpd, python3-mod_wsgi]
+    state: present
+
+- name: Apache listens on localhost only (squid is in front)
+  ansible.builtin.lineinfile:
+    path: /etc/httpd/conf/httpd.conf
+    regexp: '^Listen '
+    line: "Listen {{ httpd_listen }}"
+  notify: Reload httpd
+
+- name: Repository public key directory
+  ansible.builtin.file:
+    path: "{{ cvmfs_key_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Repository public key
+  ansible.builtin.copy:
+    src: "keys/{{ cvmfs_repository }}.pub"
+    dest: "{{ cvmfs_key_dir }}/{{ cvmfs_repository }}.pub"
+    mode: "0644"
+
+- name: Start httpd
+  ansible.builtin.systemd:
+    name: httpd
+    enabled: true
+    state: started
+
+- name: Create replica
+  ansible.builtin.command:
+    cmd: >-
+      cvmfs_server add-replica -o {{ cvmfs_replica_owner }}
+      {{ cvmfs_stratum0_url }} {{ cvmfs_key_dir }}
+    creates: "/etc/cvmfs/repositories.d/{{ cvmfs_repository }}"
+  notify: Initial snapshot
+
+- name: Snapshot cron job
+  ansible.builtin.copy:
+    dest: /etc/cron.d/cvmfs_stratum1_snapshot
+    content: |
+      {{ cvmfs_snapshot_minute }} * * * * root output=$(/usr/bin/cvmfs_server snapshot -a -i 2>&1) || echo "$output"
+    mode: "0644"
+
+- name: Garbage collection cron job
+  ansible.builtin.copy:
+    dest: /etc/cron.d/cvmfs_stratum1_gc
+    content: |
+      # Run CVMFS Stratum 1 garbage collection weekly
+      {{ cvmfs_gc_schedule }} root /usr/bin/cvmfs_server gc -a >> /var/log/cvmfs_gc.log 2>&1
+    mode: "0644"
+
+- name: Remove legacy GC entry from root's crontab (now in /etc/cron.d)
+  ansible.builtin.lineinfile:
+    path: /var/spool/cron/root
+    regexp: 'cvmfs_server gc'
+    state: absent
+  failed_when: false

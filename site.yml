@@ -1,0 +1,7 @@
+- name: CVMFS Stratum 1 servers
+  hosts: stratum1
+  roles:
+    - { role: common, tags: [common] }
+    - { role: cvmfs_stratum1, tags: [cvmfs] }
+    - { role: squid, tags: [squid] }
+    - { role: access_stats, tags: [access_stats] }

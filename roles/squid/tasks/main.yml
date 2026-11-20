@@ -1,0 +1,26 @@
+- name: Install squid
+  ansible.builtin.dnf:
+    name: squid
+    state: present
+
+- name: Squid configuration (reverse proxy in front of httpd)
+  ansible.builtin.template:
+    src: squid.conf.j2
+    dest: /etc/squid/squid.conf
+    owner: root
+    group: squid
+    mode: "0640"
+    validate: /usr/sbin/squid -k parse -f %s
+  notify: Reload squid
+
+- name: Squid log rotation
+  ansible.builtin.copy:
+    src: squid.logrotate
+    dest: /etc/logrotate.d/squid
+    mode: "0644"
+
+- name: Start squid
+  ansible.builtin.systemd:
+    name: squid
+    enabled: true
+    state: started

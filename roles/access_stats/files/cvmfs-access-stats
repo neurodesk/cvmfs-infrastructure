@@ -1,0 +1,767 @@
+#!/usr/bin/python3 -I
+"""
+cvmfs-access-stats -- privacy-preserving container usage statistics for a
+CernVM-FS Stratum 1.
+
+How it works
+  * Each container in the repository lives in its own nested catalog
+    (/containers/<tool>_<version>_<date>).  A client (or the site squid in
+    front of it) must download that catalog to open the container, so
+    catalog downloads (URLs ending in "C") are a cheap, accurate proxy for
+    "container X was opened from network Y".
+  * Catalog hashes are mapped to paths by reading only the requested catalog
+    objects from local disk (their 'root_prefix' property); cached by hash.
+  * The squid access log is parsed incrementally (watermark on timestamp).
+  * Client IPs are geolocated with the GeoIP DB that cvmfs-server already
+    maintains, then immediately reduced to (continent, country) plus a salted
+    HMAC used only to count *distinct* networks.  Raw IPs are never stored.
+  * The public report only shows continent/country aggregates; any group with
+    fewer than --min-networks distinct networks is merged into a coarser
+    bucket ("Other <continent>" / "Undisclosed").
+
+Outputs
+  private:  <state-dir>/state.db      (root only; salted hashes, aggregates)
+  public:   <output-dir>/index.html, <output-dir>/stats.json
+"""
+
+import argparse
+import datetime as dt
+import glob
+import gzip
+import hashlib
+import hmac
+import html
+import ipaddress
+import json
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+import time
+import zlib
+
+GEO_LIB = "/usr/share/cvmfs-server/webapi"     # bundled maxminddb reader
+GEO_DB = "/var/lib/cvmfs-server/geo/iplocation.mmdb"
+
+CONTINENTS = {
+    "AF": "Africa", "AN": "Antarctica", "AS": "Asia", "EU": "Europe",
+    "NA": "North America", "OC": "Oceania", "SA": "South America",
+    "PRIV": "Private networks", "UNK": "Unknown",
+}
+INDEX = "(repository index)"
+
+
+# ---------------------------------------------------------------- state db --
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS catalogs (hash TEXT PRIMARY KEY, path TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS countries (code TEXT PRIMARY KEY, name TEXT, continent TEXT);
+-- aggregates (kept forever, contain no client identifiers)
+CREATE TABLE IF NOT EXISTS fetches (
+    day TEXT, container TEXT, country TEXT, n INTEGER,
+    PRIMARY KEY (day, container, country));
+CREATE TABLE IF NOT EXISTS traffic (
+    day TEXT, country TEXT, requests INTEGER, bytes INTEGER,
+    PRIMARY KEY (day, country));
+-- salted network hashes for distinct counting (purged after retention)
+CREATE TABLE IF NOT EXISTS seen_container (
+    day TEXT, container TEXT, country TEXT, net TEXT,
+    PRIMARY KEY (day, container, country, net)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS seen_any (
+    day TEXT, country TEXT, net TEXT,
+    PRIMARY KEY (day, country, net)) WITHOUT ROWID;
+"""
+
+
+def open_state(state_dir):
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    os.chmod(state_dir, 0o700)
+    db = sqlite3.connect(os.path.join(state_dir, "state.db"))
+    db.executescript(SCHEMA)
+    os.chmod(os.path.join(state_dir, "state.db"), 0o600)
+    return db
+
+
+def meta_get(db, k, default=None):
+    r = db.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+    return r[0] if r else default
+
+
+def meta_set(db, k, v):
+    db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (k, str(v)))
+
+
+def get_secret(state_dir):
+    path = os.path.join(state_dir, "secret")
+    if not os.path.exists(path):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, os.urandom(32))
+        os.close(fd)
+    with open(path, "rb") as f:
+        return f.read()
+
+
+# ---------------------------------------------------------- catalog mapping --
+
+class CatalogResolver:
+    """Map catalog hash -> repository path, lazily and only for catalogs that
+    clients actually requested.  Each catalog records its own path in the
+    'root_prefix' property, so old/orphaned revisions resolve too.  Results
+    are cached in the state db (catalogs are immutable by hash)."""
+
+    def __init__(self, db, repo_dir, tmpdir):
+        self.db = db
+        self.repo_dir = repo_dir
+        self.tmpdir = tmpdir
+        self.cache = dict(db.execute("SELECT hash, path FROM catalogs"))
+        self.new = 0
+
+    def path(self, h):
+        p = self.cache.get(h)
+        if p is None:
+            p = self._resolve(h)
+            self.cache[h] = p
+            self.db.execute("INSERT OR REPLACE INTO catalogs VALUES (?,?)", (h, p))
+            self.new += 1
+        return p if p != "?" else None
+
+    def _resolve(self, h):
+        obj = os.path.join(self.repo_dir, "data", h[:2], h[2:] + "C")
+        try:
+            with open(obj, "rb") as f:
+                raw = zlib.decompress(f.read())
+        except (OSError, zlib.error):
+            return "?"                       # missing / garbage collected
+        fd, tmp = tempfile.mkstemp(dir=self.tmpdir, suffix=".db")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+            conn = sqlite3.connect(tmp)
+            try:
+                r = conn.execute("SELECT value FROM properties "
+                                 "WHERE key='root_prefix'").fetchone()
+            except sqlite3.Error:
+                r = None
+            conn.close()
+            if r is None:
+                return ""                    # root catalog has no prefix
+            return r[0] if r[0] != "/" else ""
+        finally:
+            os.unlink(tmp)
+
+
+def container_of(path):
+    """Map a catalog path to its container (top-level dir under /containers)."""
+    parts = path.strip("/").split("/")
+    if len(parts) >= 2 and parts[0] == "containers":
+        return parts[1]
+    return INDEX
+
+
+def split_container(name):
+    """fsl_6.0.4_20210105 -> ('fsl', '6.0.4', '20210105')"""
+    parts = name.split("_")
+    if len(parts) >= 3 and re.fullmatch(r"\d{8}", parts[-1]):
+        return "_".join(parts[:-2]), parts[-2], parts[-1]
+    return name, "", ""
+
+
+# ------------------------------------------------------------- log parsing --
+
+def log_files(pattern):
+    """Squid logs in chronological order: rotated (by date suffix) then live."""
+    live = pattern
+    rotated = sorted(f for f in glob.glob(live + "-*")
+                     if re.search(r"-\d{8}(\.gz)?$", f))
+    return rotated + ([live] if os.path.exists(live) else [])
+
+
+class Geo:
+    def __init__(self, path):
+        sys.path.insert(0, GEO_LIB)
+        import maxminddb  # noqa: E402  (bundled with cvmfs-server)
+        self.reader = maxminddb.open_database(path)
+        self.cache = {}
+        self.countries = {}
+
+    def locate(self, ip):
+        """Return country key, or None for loopback/unparseable (= skip)."""
+        c = self.cache.get(ip)
+        if c is not None:
+            return c
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return None
+        if addr.is_loopback:
+            c = ""
+        elif addr.is_private or addr.is_link_local:
+            c = "PRIV"
+            self.countries[c] = ("Private networks", "PRIV")
+        else:
+            rec = None
+            try:
+                rec = self.reader.get(ip)
+            except Exception:
+                pass
+            if rec and rec.get("country"):
+                c = rec["country"].get("iso_code") or "UNK"
+                name = rec["country"].get("names", {}).get("en", c)
+                cont = (rec.get("continent") or {}).get("code", "UNK")
+                self.countries[c] = (name, cont)
+            else:
+                c = "UNK"
+                self.countries[c] = ("Unknown", "UNK")
+        self.cache[ip] = c
+        return c
+
+
+def parse_logs(db, args, secret, log):
+    geo = Geo(args.geo_db)
+    tmpdir = tempfile.mkdtemp(dir=args.state_dir)
+    catalogs = CatalogResolver(db, args.repo_dir, tmpdir)
+    watermark = float(meta_get(db, "watermark", "0"))
+    cat_re = re.compile(r"/cvmfs/%s/data/([0-9a-f]{2})/([0-9a-f]{38,})C(?:\?[^ ]*)?$"
+                        % re.escape(args.repo))
+    repo_marker = "/cvmfs/%s/" % args.repo
+    nethash = {}
+    unmapped = 0
+    new_wm = watermark
+    total = 0
+
+    for path in log_files(args.squid_log):
+        opener = gzip.open if path.endswith(".gz") else open
+        fetches, traffic = {}, {}
+        seen_c, seen_a = set(), set()
+        n = 0
+        with opener(path, "rt", errors="replace") as f:
+            for line in f:
+                p = line.split()
+                if len(p) < 7:
+                    continue
+                try:
+                    ts = float(p[0])
+                except ValueError:
+                    continue
+                if ts <= watermark:
+                    continue
+                if ts > new_wm:
+                    new_wm = ts
+                url = p[6]
+                if repo_marker not in url or url.endswith(".cvmfspublished"):
+                    continue        # heartbeats / health checks / other paths
+                if p[5] != "GET" or not p[3].endswith(("/200", "/206")):
+                    continue
+                country = geo.locate(p[2])
+                if not country:
+                    continue        # loopback / garbage
+                net = nethash.get(p[2])
+                if net is None:
+                    net = hmac.new(secret, p[2].encode(),
+                                   hashlib.sha256).hexdigest()[:20]
+                    nethash[p[2]] = net
+                day = time.strftime("%Y-%m-%d", time.gmtime(ts))
+                n += 1
+                try:
+                    size = int(p[4])
+                except ValueError:
+                    size = 0
+                t = traffic.setdefault((day, country), [0, 0])
+                t[0] += 1
+                t[1] += size
+                seen_a.add((day, country, net))
+                m = cat_re.search(url)
+                if m:
+                    cpath = catalogs.path(m.group(1) + m.group(2))
+                    if cpath is None:
+                        unmapped += 1
+                        continue
+                    cont = container_of(cpath)
+                    k = (day, cont, country)
+                    fetches[k] = fetches.get(k, 0) + 1
+                    seen_c.add((day, cont, country, net))
+        db.executemany(
+            "INSERT INTO fetches VALUES (?,?,?,?) ON CONFLICT (day, container, country) DO UPDATE "
+            "SET n = n + excluded.n",
+            [(d, c, co, v) for (d, c, co), v in fetches.items()])
+        db.executemany(
+            "INSERT INTO traffic VALUES (?,?,?,?) ON CONFLICT (day, country) DO UPDATE "
+            "SET requests = requests + excluded.requests, bytes = bytes + excluded.bytes",
+            [(d, co, r, b) for (d, co), (r, b) in traffic.items()])
+        db.executemany("INSERT OR IGNORE INTO seen_container VALUES (?,?,?,?)", seen_c)
+        db.executemany("INSERT OR IGNORE INTO seen_any VALUES (?,?,?)", seen_a)
+        db.executemany("INSERT OR REPLACE INTO countries VALUES (?,?,?)",
+                       [(c, nm, ct) for c, (nm, ct) in geo.countries.items()])
+        meta_set(db, "watermark", new_wm)
+        db.commit()
+        total += n
+        if n:
+            log("%s: %d new requests" % (path, n))
+    nethash.clear()
+    os.rmdir(tmpdir)
+    log("parsed %d new requests; resolved %d new catalogs; "
+        "%d catalog fetches unresolvable" % (total, catalogs.new, unmapped))
+
+
+def purge(db, retention_days):
+    cutoff = (dt.date.today() - dt.timedelta(days=retention_days)).isoformat()
+    db.execute("DELETE FROM seen_container WHERE day < ?", (cutoff,))
+    db.execute("DELETE FROM seen_any WHERE day < ?", (cutoff,))
+    db.commit()
+
+
+# ----------------------------------------------------------------- report --
+
+class Report:
+    def __init__(self, db, k):
+        self.db = db
+        self.k = k
+        self.countries = {c: (n, ct) for c, n, ct in
+                          db.execute("SELECT code, name, continent FROM countries")}
+
+    def cont_of(self, country):
+        return self.countries.get(country, ("", "UNK"))[1]
+
+    def name_of(self, country):
+        return self.countries.get(country, (country, ""))[0]
+
+    def bucket_countries(self, rows):
+        """rows: {country: (set(nets), {metric: value})} -> list of public rows
+        where every row has >= k distinct networks or is the final catch-all."""
+        out, other_by_cont = [], {}
+        for c, (nets, m) in rows.items():
+            if len(nets) >= self.k and c not in ("PRIV", "UNK"):
+                out.append({"region": self.name_of(c), "code": c,
+                            "continent": CONTINENTS.get(self.cont_of(c), "Unknown"),
+                            "networks": len(nets), **m})
+            else:
+                b = other_by_cont.setdefault(self.cont_of(c), [set(), {}])
+                b[0] |= nets
+                for key, v in m.items():
+                    b[1][key] = b[1].get(key, 0) + v
+        undisclosed = [set(), {}]
+        for cont, (nets, m) in other_by_cont.items():
+            if len(nets) >= self.k and cont not in ("UNK",):
+                label = ("Private networks" if cont == "PRIV"
+                         else "Other countries in " + CONTINENTS.get(cont, cont))
+                out.append({"region": label, "code": "", "continent":
+                            CONTINENTS.get(cont, "Unknown"),
+                            "networks": len(nets), **m})
+            else:
+                undisclosed[0] |= nets
+                for key, v in m.items():
+                    undisclosed[1][key] = undisclosed[1].get(key, 0) + v
+        if undisclosed[0]:
+            out.append({"region": "Undisclosed / unknown", "code": "",
+                        "continent": "", "networks": len(undisclosed[0]),
+                        **undisclosed[1]})
+        out.sort(key=lambda r: -r.get("requests", r.get("fetches", 0)))
+        return out
+
+    def window(self, days):
+        since = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+        return since
+
+    def regions(self, days):
+        since = self.window(days)
+        rows = {}
+        for c, req, b in self.db.execute(
+                "SELECT country, SUM(requests), SUM(bytes) FROM traffic "
+                "WHERE day >= ? GROUP BY country", (since,)):
+            rows[c] = [set(), {"requests": req, "bytes": b, "fetches": 0}]
+        for c, n in self.db.execute(
+                "SELECT country, SUM(n) FROM fetches WHERE day >= ? "
+                "AND container != ? GROUP BY country", (since, INDEX)):
+            rows.setdefault(c, [set(), {"requests": 0, "bytes": 0, "fetches": 0}])
+            rows[c][1]["fetches"] = n
+        for c, net in self.db.execute(
+                "SELECT DISTINCT country, net FROM seen_any WHERE day >= ?", (since,)):
+            rows.setdefault(c, [set(), {"requests": 0, "bytes": 0, "fetches": 0}])
+            rows[c][0].add(net)
+        return self.bucket_countries({c: (s, m) for c, (s, m) in rows.items()})
+
+    def continents(self, days):
+        since = self.window(days)
+        agg = {}
+        for c, req, b in self.db.execute(
+                "SELECT country, SUM(requests), SUM(bytes) FROM traffic "
+                "WHERE day >= ? GROUP BY country", (since,)):
+            a = agg.setdefault(self.cont_of(c), [set(), 0, 0])
+            a[1] += req
+            a[2] += b
+        for c, net in self.db.execute(
+                "SELECT DISTINCT country, net FROM seen_any WHERE day >= ?", (since,)):
+            agg.setdefault(self.cont_of(c), [set(), 0, 0])[0].add(net)
+        out, hidden = [], [set(), 0, 0]
+        for cont, (nets, req, b) in agg.items():
+            if len(nets) >= self.k and cont != "UNK":
+                out.append({"continent": CONTINENTS.get(cont, cont),
+                            "networks": len(nets), "requests": req, "bytes": b})
+            else:
+                hidden[0] |= nets
+                hidden[1] += req
+                hidden[2] += b
+        if hidden[0]:
+            out.append({"continent": "Undisclosed / unknown",
+                        "networks": len(hidden[0]), "requests": hidden[1],
+                        "bytes": hidden[2]})
+        out.sort(key=lambda r: -r["requests"])
+        return out
+
+    def containers(self, days):
+        """Per container: fetches, distinct networks, k-anonymous continents."""
+        since = self.window(days)
+        res = {}
+        for c, n in self.db.execute(
+                "SELECT container, SUM(n) FROM fetches WHERE day >= ? "
+                "GROUP BY container", (since,)):
+            res[c] = {"fetches": n, "nets": set(), "cont": {}}
+        for c, country, net in self.db.execute(
+                "SELECT container, country, net FROM seen_container "
+                "WHERE day >= ?", (since,)):
+            r = res.setdefault(c, {"fetches": 0, "nets": set(), "cont": {}})
+            r["nets"].add(net)
+            r["cont"].setdefault(self.cont_of(country), set()).add(net)
+        out = {}
+        for c, r in res.items():
+            conts, hidden = {}, set()
+            for cont, nets in r["cont"].items():
+                if len(nets) >= self.k and cont not in ("UNK", "PRIV"):
+                    conts[CONTINENTS[cont]] = len(nets)
+                else:
+                    hidden |= nets
+            if hidden:
+                conts["Other / undisclosed"] = len(hidden)
+            out[c] = {"fetches": r["fetches"], "networks": len(r["nets"]),
+                      "continents": conts}
+        return out
+
+    def daily(self, days):
+        since = self.window(days)
+        f = dict(self.db.execute(
+            "SELECT day, SUM(n) FROM fetches WHERE day >= ? AND container != ? "
+            "GROUP BY day", (since, INDEX)))
+        t = {d: (r, b) for d, r, b in self.db.execute(
+            "SELECT day, SUM(requests), SUM(bytes) FROM traffic WHERE day >= ? "
+            "GROUP BY day", (since,))}
+        nets = dict(self.db.execute(
+            "SELECT day, COUNT(DISTINCT net) FROM seen_any WHERE day >= ? "
+            "GROUP BY day", (since,)))
+        out = []
+        for d in sorted(set(f) | set(t)):
+            out.append({"day": d, "fetches": f.get(d, 0),
+                        "requests": t.get(d, (0, 0))[0],
+                        "bytes": t.get(d, (0, 0))[1],
+                        "networks": nets.get(d, 0)})
+        return out
+
+    def build(self, repo, hostname, retention):
+        first = self.db.execute("SELECT MIN(day) FROM traffic").fetchone()[0]
+        last = self.db.execute("SELECT MAX(day) FROM traffic").fetchone()[0]
+        c30, c365 = self.containers(30), self.containers(365)
+        versions = []
+        tools = {}
+        for name in sorted(set(c30) | set(c365)):
+            if name == INDEX:
+                continue
+            tool, ver, date = split_container(name)
+            a = c30.get(name, {"fetches": 0, "networks": 0, "continents": {}})
+            b = c365.get(name, {"fetches": 0, "networks": 0, "continents": {}})
+            versions.append({"container": name, "tool": tool, "version": ver,
+                             "build": date, "fetches_30d": a["fetches"],
+                             "networks_30d": a["networks"],
+                             "fetches_365d": b["fetches"],
+                             "networks_365d": b["networks"],
+                             "continents_365d": b["continents"]})
+            t = tools.setdefault(tool, {"tool": tool, "versions": 0,
+                                        "fetches_30d": 0, "fetches_365d": 0})
+            t["versions"] += 1
+            t["fetches_30d"] += a["fetches"]
+            t["fetches_365d"] += b["fetches"]
+        # distinct networks per tool need a union over versions
+        for days, key in ((30, "networks_30d"), (365, "networks_365d")):
+            since = self.window(days)
+            per = {}
+            for c, net in self.db.execute(
+                    "SELECT DISTINCT container, net FROM seen_container "
+                    "WHERE day >= ? AND container != ?", (since, INDEX)):
+                per.setdefault(split_container(c)[0], set()).add(net)
+            for tool, nets in per.items():
+                if tool in tools:
+                    tools[tool][key] = len(nets)
+        for t in tools.values():
+            t.setdefault("networks_30d", 0)
+            t.setdefault("networks_365d", 0)
+        versions.sort(key=lambda r: (-r["fetches_30d"], -r["fetches_365d"]))
+        toollist = sorted(tools.values(),
+                          key=lambda r: (-r["fetches_30d"], -r["fetches_365d"]))
+        return {
+            "repository": repo,
+            "server": hostname,
+            "generated": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "data_from": first, "data_to": last,
+            "min_networks_per_group": self.k,
+            "distinct_window_limit_days": retention,
+            "daily": self.daily(180),
+            "continents_30d": self.continents(30),
+            "continents_365d": self.continents(365),
+            "regions_30d": self.regions(30),
+            "regions_365d": self.regions(365),
+            "tools": toollist,
+            "containers": versions,
+        }
+
+
+# ------------------------------------------------------------------- html --
+
+def fmt_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(n) < 1000:
+            return ("%.0f %s" if unit == "B" else "%.1f %s") % (n, unit)
+        n /= 1000.0
+    return "%.1f EB" % n
+
+
+def fmt_n(n):
+    return "{:,}".format(n).replace(",", " ")
+
+
+def e(s):
+    return html.escape(str(s), quote=True)
+
+
+def bar_chart(daily, key, label):
+    data = daily[-90:]
+    if not data:
+        return "<p class='muted'>No data yet.</p>"
+    w, h, pad = 900, 180, 28
+    mx = max(d[key] for d in data) or 1
+    bw = (w - pad) / len(data)
+    bars = []
+    for i, d in enumerate(data):
+        bh = (h - pad) * d[key] / mx
+        x = pad + i * bw
+        bars.append(
+            "<rect x='%.1f' y='%.1f' width='%.1f' height='%.1f'><title>%s: %s</title></rect>"
+            % (x + 0.5, h - pad - bh + 4, max(bw - 1.5, 1), bh, e(d["day"]),
+               fmt_n(d[key])))
+    ticks = ("<text x='%d' y='%d' class='ax'>%s</text>" % (pad, h - 6, e(data[0]["day"]))
+             + "<text x='%d' y='%d' class='ax' text-anchor='end'>%s</text>"
+             % (w, h - 6, e(data[-1]["day"]))
+             + "<text x='0' y='14' class='ax'>%s</text>" % fmt_n(mx)
+             + "<line x1='%d' x2='%d' y1='%d' y2='%d' class='base'/>"
+             % (pad, w, h - pad + 4, h - pad + 4))
+    return ("<svg viewBox='0 0 %d %d' role='img' aria-label='%s' class='chart'>%s%s</svg>"
+            % (w, h, e(label), "".join(bars), ticks))
+
+
+def table(headers, rows, cls=""):
+    th = "".join("<th%s>%s</th>" % (" class='num'" if num else "", e(h))
+                 for h, num in headers)
+    body = []
+    for r in rows:
+        body.append("<tr>" + "".join(
+            "<td%s>%s</td>" % (" class='num'" if num else "", v)
+            for v, (_, num) in zip(r, headers)) + "</tr>")
+    return ("<div class='tw'><table class='%s'><thead><tr>%s</tr></thead>"
+            "<tbody>%s</tbody></table></div>" % (cls, th, "".join(body)))
+
+
+def render_html(s):
+    d30 = [d for d in s["daily"]][-30:]
+    tot_fetch = sum(d["fetches"] for d in d30)
+    tot_bytes = sum(d["bytes"] for d in d30)
+    active_tools = sum(1 for t in s["tools"] if t["fetches_30d"])
+    active_versions = sum(1 for c in s["containers"] if c["fetches_30d"])
+    k = s["min_networks_per_group"]
+
+    def region_rows(rows):
+        return [(e(r["region"]), e(r.get("continent", "")), fmt_n(r["networks"]),
+                 fmt_n(r["fetches"]), fmt_n(r["requests"]), e(fmt_bytes(r["bytes"])))
+                for r in rows]
+
+    region_hdr = [("Region", False), ("Continent", False), ("Clients", True),
+                  ("Container opens", True), ("Requests", True), ("Data served", True)]
+
+    cont_rows = [(e(r["continent"]), fmt_n(r["networks"]), fmt_n(r["requests"]),
+                  e(fmt_bytes(r["bytes"]))) for r in s["continents_30d"]]
+    cont_hdr = [("Continent", False), ("Clients", True), ("Requests", True),
+                ("Data served", True)]
+
+    tool_rows = [(e(t["tool"]), fmt_n(t["versions"]), fmt_n(t["fetches_30d"]),
+                  fmt_n(t["networks_30d"]), fmt_n(t["fetches_365d"]),
+                  fmt_n(t["networks_365d"])) for t in s["tools"]]
+    tool_hdr = [("Tool", False), ("Versions", True), ("Opens 30d", True),
+                ("Clients 30d", True), ("Opens 365d", True), ("Clients 365d", True)]
+
+    ver_rows = []
+    for c in s["containers"][:100]:
+        conts = ", ".join("%s (%d)" % (e(kk), v) for kk, v in
+                          sorted(c["continents_365d"].items(), key=lambda x: -x[1]))
+        ver_rows.append((e(c["tool"]), e(c["version"]), e(c["build"]),
+                         fmt_n(c["fetches_30d"]), fmt_n(c["fetches_365d"]),
+                         fmt_n(c["networks_365d"]), conts or "–"))
+    ver_hdr = [("Tool", False), ("Version", False), ("Build", False),
+               ("Opens 30d", True), ("Opens 365d", True), ("Clients 365d", True),
+               ("Continents (clients, 365d)", False)]
+
+    return """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CVMFS Container Usage</title>
+<style>
+:root{--bg:#fbfbfa;--fg:#1d1f21;--muted:#6b6f76;--line:#e3e4e6;--card:#fff;--accent:#2f6fb3;--chip:#eef3f9}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#141518;--fg:#e6e6e6;--muted:#9aa0a6;--line:#2c2f34;--card:#1b1d21;--accent:#6aa6e8;--chip:#22303f}}
+:root[data-theme="dark"]{--bg:#141518;--fg:#e6e6e6;--muted:#9aa0a6;--line:#2c2f34;--card:#1b1d21;--accent:#6aa6e8;--chip:#22303f}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:26px;margin:0 0 4px}h2{font-size:18px;margin:36px 0 10px}
+.muted{color:var(--muted)}.sub{color:var(--muted);margin:0 0 20px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+.tile b{display:block;font-size:24px;font-variant-numeric:tabular-nums}
+.tile span{color:var(--muted);font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+.chart{width:100%%;height:auto;display:block}.chart rect{fill:var(--accent)}
+.chart .ax{fill:var(--muted);font-size:11px}.chart .base{stroke:var(--line)}
+.tw{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;width:100%%;font-size:14px}
+th,td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-weight:600;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.03em;white-space:nowrap}
+tr:last-child td{border-bottom:0}.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+input{width:100%%;max-width:320px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit;margin-bottom:10px}
+details{margin-top:8px}summary{cursor:pointer;color:var(--accent)}
+footer{margin-top:40px;font-size:13px;color:var(--muted)}a{color:var(--accent)}
+</style></head><body><main>
+<h1>Container usage statistics</h1>
+<p class="sub">Repository <code>%(repo)s</code> &middot; Stratum&nbsp;1 <code>%(host)s</code>
+&middot; data %(from)s &ndash; %(to)s &middot; updated %(gen)s</p>
+
+<div class="tiles">
+<div class="tile"><b>%(tf)s</b><span>container opens, last 30 days</span></div>
+<div class="tile"><b>%(at)s</b><span>tools used, last 30 days</span></div>
+<div class="tile"><b>%(av)s</b><span>container versions used, last 30 days</span></div>
+<div class="tile"><b>%(tb)s</b><span>data served, last 30 days</span></div>
+</div>
+
+<h2>Container opens per day</h2>
+<div class="card">%(chart)s</div>
+
+<h2>By continent (last 30 days)</h2>
+%(conts)s
+
+<h2>By region (last 30 days)</h2>
+%(r30)s
+<details><summary>Last 365 days</summary>%(r365)s</details>
+
+<h2>Tools</h2>
+<input id="q" type="search" placeholder="Filter tools&hellip;" aria-label="Filter tools">
+%(tools)s
+
+<h2>Top container versions</h2>
+%(vers)s
+<p class="muted">Full per-version data: <a href="stats.json">stats.json</a></p>
+
+<h2>Methodology &amp; privacy</h2>
+<div class="card">
+<p><b>Container opens</b> count downloads of a container's file catalog from this
+server. Clients and site caches (squid proxies) keep catalogs locally, so one
+&ldquo;open&rdquo; usually stands for many runs at a site; numbers indicate
+reach, not total executions. Traffic served by other Stratum&nbsp;1 servers is not included.</p>
+<p><b>Clients</b> are distinct client addresses as seen by this server (counted via salted hashes). These
+are often site proxies or short-lived cloud/CI machines rather than individual users.</p>
+<p><b>Privacy:</b> no IP addresses, host names or cities are stored or published.
+Addresses are reduced to continent and country on arrival; any group with fewer
+than %(k)d distinct clients is merged into a coarser region (&ldquo;Other
+countries in &hellip;&rdquo; or &ldquo;Undisclosed&rdquo;).</p>
+</div>
+
+<footer>Generated by cvmfs-access-stats.
+<a href="https://db-ip.com">IP Geolocation by DB-IP</a> (CC BY 4.0).</footer>
+</main>
+<script>
+(function(){var q=document.getElementById('q');if(!q)return;
+var rows=q.nextElementSibling.querySelectorAll('tbody tr');
+q.addEventListener('input',function(){var v=q.value.toLowerCase();
+rows.forEach(function(r){r.style.display=r.cells[0].textContent.toLowerCase().indexOf(v)>=0?'':'none';});});})();
+</script>
+</body></html>
+""" % {
+        "repo": e(s["repository"]), "host": e(s["server"]),
+        "from": e(s["data_from"] or "–"), "to": e(s["data_to"] or "–"),
+        "gen": e(s["generated"]), "tf": fmt_n(tot_fetch), "tb": e(fmt_bytes(tot_bytes)),
+        "at": fmt_n(active_tools), "av": fmt_n(active_versions),
+        "chart": bar_chart(s["daily"], "fetches", "Container opens per day"),
+        "conts": table(cont_hdr, cont_rows),
+        "r30": table(region_hdr, region_rows(s["regions_30d"])),
+        "r365": table(region_hdr, region_rows(s["regions_365d"])),
+        "tools": table(tool_hdr, tool_rows),
+        "vers": table(ver_hdr, ver_rows),
+        "k": k,
+    }
+
+
+def write_atomic(path, data):
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(data)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------- main --
+
+def default_repo():
+    repos = os.listdir("/etc/cvmfs/repositories.d") if os.path.isdir(
+        "/etc/cvmfs/repositories.d") else []
+    return repos[0] if len(repos) == 1 else None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo", default=default_repo())
+    ap.add_argument("--repo-dir", help="default: /srv/cvmfs/<repo>")
+    ap.add_argument("--squid-log", default="/var/log/squid/access.log")
+    ap.add_argument("--geo-db", default=GEO_DB)
+    ap.add_argument("--state-dir", default="/var/lib/cvmfs-access-stats")
+    ap.add_argument("--output-dir", default="/var/www/html/stats")
+    ap.add_argument("--min-networks", type=int, default=3,
+                    help="k-anonymity threshold per published group (default 3)")
+    ap.add_argument("--retention-days", type=int, default=400,
+                    help="keep salted network hashes this long (default 400)")
+    ap.add_argument("--report-only", action="store_true")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    args = ap.parse_args()
+    if not args.repo:
+        ap.error("--repo is required (more than one repository configured)")
+    args.repo_dir = args.repo_dir or os.path.join("/srv/cvmfs", args.repo)
+    if args.min_networks < 2:
+        ap.error("--min-networks must be at least 2")
+
+    def log(msg):
+        if not args.quiet:
+            print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+    os.umask(0o077)
+    db = open_state(args.state_dir)
+    if not args.report_only:
+        secret = get_secret(args.state_dir)
+        parse_logs(db, args, secret, log)
+        purge(db, args.retention_days)
+    stats = Report(db, args.min_networks).build(
+        args.repo, os.uname().nodename, args.retention_days)
+    os.makedirs(args.output_dir, mode=0o755, exist_ok=True)
+    os.chmod(args.output_dir, 0o755)
+    write_atomic(os.path.join(args.output_dir, "stats.json"),
+                 json.dumps(stats, indent=1, ensure_ascii=False))
+    write_atomic(os.path.join(args.output_dir, "index.html"), render_html(stats))
+    log("report written to %s" % args.output_dir)
+
+
+if __name__ == "__main__":
+    main()

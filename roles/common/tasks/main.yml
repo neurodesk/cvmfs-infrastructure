@@ -1,0 +1,38 @@
+- name: Install EPEL
+  ansible.builtin.dnf:
+    name: epel-release
+    state: present
+
+- name: Install base packages
+  ansible.builtin.dnf:
+    name: [fail2ban-server, fail2ban-systemd, monit, chrony]
+    state: present
+
+- name: Configure monit
+  ansible.builtin.template:
+    src: monitrc.j2
+    dest: /etc/monitrc
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  # without the vault secret, leave the existing monitrc untouched rather
+  # than silently dropping e-mail alerting
+  when: monit_smtp_password | length > 0
+  notify: Reload monit
+
+- name: Monit disk space check
+  ansible.builtin.copy:
+    src: monit-diskspace
+    dest: /etc/monit.d/diskspace
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload monit
+
+- name: Enable base services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop: [fail2ban, monit, chronyd]

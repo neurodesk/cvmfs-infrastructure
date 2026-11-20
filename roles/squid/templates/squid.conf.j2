@@ -1,0 +1,9 @@
+# {{ ansible_managed }}
+{% for port in squid_http_ports %}
+http_port {{ port }} accel
+{% endfor %}
+http_access allow all
+cache_peer {{ httpd_listen.split(':')[0] }} parent {{ httpd_listen.split(':')[1] }} 0 no-query originserver
+acl CVMFSAPI urlpath_regex ^/cvmfs/[^/]*/api/
+cache deny !CVMFSAPI
+cache_mem {{ squid_cache_mem }}

@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+{% if monit_smtp_password %}
+set mailserver {{ monit_smtp_server }} port {{ monit_smtp_port }}
+    username "{{ monit_smtp_user }}"
+    password "{{ monit_smtp_password }}"
+    using tls
+    with timeout 30 seconds
+set alert {{ monit_alert_email }}
+{% endif %}
+set daemon  30              # check services at 30 seconds intervals
+set log syslog
+set httpd port 2812 and
+    use address localhost  # only accept connection from localhost
+    allow localhost
+include /etc/monit.d/*

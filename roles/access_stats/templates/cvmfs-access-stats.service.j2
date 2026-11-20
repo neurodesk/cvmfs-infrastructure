@@ -1,0 +1,27 @@
+# {{ ansible_managed }}
+[Unit]
+Description=CVMFS container usage statistics (privacy-preserving, public report in /stats/)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cvmfs-access-stats --quiet --min-networks {{ access_stats_min_networks }} --retention-days {{ access_stats_retention_days }}
+# keep load on the Stratum 1 negligible
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+CPUQuota=50%
+MemoryMax=1G
+# sandboxing: read-only everywhere except state + public output
+ProtectSystem=strict
+ReadWritePaths=/var/lib/cvmfs-access-stats /var/www/html/stats
+StateDirectory=cvmfs-access-stats
+StateDirectoryMode=0700
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectHome=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+UMask=0077

@@ -1,0 +1,40 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: pip install "ansible-core==2.16.14" "ansible-lint==24.12.2"
+
+      - name: Refuse unencrypted vault files
+        run: |
+          fail=0
+          for f in $(git ls-files '*vault.yml'); do
+            if ! head -n1 "$f" | grep -q '^\$ANSIBLE_VAULT'; then
+              echo "::error file=$f::vault file is not encrypted"; fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Python syntax (stats script must stay Python 3.9 compatible)
+        run: python -m py_compile roles/access_stats/files/cvmfs-access-stats
+
+      - name: Playbook syntax
+        run: ansible-playbook --syntax-check site.yml
+
+      - name: ansible-lint
+        run: ansible-lint site.yml

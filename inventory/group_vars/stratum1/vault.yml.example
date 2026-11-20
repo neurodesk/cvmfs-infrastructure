@@ -1,0 +1,5 @@
+# Secrets for the Stratum 1 servers. Create the real file encrypted:
+#   ansible-vault create inventory/group_vars/stratum1/vault.yml
+# and paste these keys in. Only the *encrypted* vault.yml may be committed
+# (CI fails if vault.yml is committed in plaintext).
+vault_monit_smtp_password: "CHANGE-ME"

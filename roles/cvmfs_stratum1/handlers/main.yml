@@ -1,0 +1,12 @@
+- name: Reload httpd
+  ansible.builtin.systemd:
+    name: httpd
+    state: reloaded
+
+- name: Initial snapshot
+  # runs in the background; a new replica can take many hours to fill
+  ansible.builtin.command:
+    cmd: "cvmfs_server snapshot {{ cvmfs_repository }}"
+  async: 172800
+  poll: 0
+  changed_when: true

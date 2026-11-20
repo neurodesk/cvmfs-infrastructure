@@ -1,0 +1,4 @@
+- name: Reload monit
+  ansible.builtin.systemd:
+    name: monit
+    state: reloaded

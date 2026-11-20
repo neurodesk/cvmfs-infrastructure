@@ -1,0 +1,43 @@
+- name: Install statistics script
+  ansible.builtin.copy:
+    src: cvmfs-access-stats
+    dest: /usr/local/sbin/cvmfs-access-stats
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Systemd service
+  ansible.builtin.template:
+    src: cvmfs-access-stats.service.j2
+    dest: /etc/systemd/system/cvmfs-access-stats.service
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Systemd timer
+  ansible.builtin.copy:
+    src: cvmfs-access-stats.timer
+    dest: /etc/systemd/system/cvmfs-access-stats.timer
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Public output directory
+  ansible.builtin.file:
+    path: /var/www/html/stats
+    state: directory
+    mode: "0755"
+
+- name: Apache config for /stats/
+  ansible.builtin.copy:
+    src: cvmfs-stats-httpd.conf
+    dest: /etc/httpd/conf.d/cvmfs-stats.conf
+    mode: "0644"
+  notify: Reload httpd for stats
+
+- name: Flush handlers before enabling the timer
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable timer
+  ansible.builtin.systemd:
+    name: cvmfs-access-stats.timer
+    enabled: true
+    state: started

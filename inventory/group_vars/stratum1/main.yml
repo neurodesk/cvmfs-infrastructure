@@ -1,0 +1,25 @@
+# Repository replicated by every Stratum 1
+cvmfs_repository: neurodesk.ardc.edu.au
+cvmfs_stratum0_url: "http://stratum0.neurodesk.cloud.edu.au/cvmfs/{{ cvmfs_repository }}"
+cvmfs_key_dir: /etc/cvmfs/keys/ardc.edu.au
+cvmfs_replica_owner: "{{ ansible_user }}"
+
+# Snapshot every 5 minutes, garbage collection Sunday 03:00
+cvmfs_snapshot_minute: "*/5"
+cvmfs_gc_schedule: "0 3 * * 0"
+
+# httpd listens locally; squid serves port 80 (and 8000) in front of it
+httpd_listen: "127.0.0.1:8080"
+squid_http_ports: [80, 8000]
+squid_cache_mem: 128 MB
+
+# monit e-mail alerts; the password lives in vault.yml (ansible-vault)
+monit_alert_email: mail.neurodesk@gmail.com
+monit_smtp_server: smtp.gmail.com
+monit_smtp_port: 587
+monit_smtp_user: mail.neurodesk@gmail.com
+monit_smtp_password: "{{ vault_monit_smtp_password | default('') }}"
+
+# Public usage statistics (k-anonymous, see roles/access_stats)
+access_stats_min_networks: 3
+access_stats_retention_days: 400
