@@ -1,0 +1,56 @@
+name: dashboard
+
+# Aggregates every Stratum 1's public /stats/stats.json into one fleet-wide
+# dashboard and publishes it on GitHub Pages.
+on:
+  schedule:
+    - cron: "30 4 * * *"   # after the servers' nightly runs (~02:15-03:00 UTC)
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - aggregate/**
+      - inventory/hosts.yml
+      - .github/workflows/dashboard.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install "pyyaml==6.0.2"
+
+      - name: Aggregate statistics from all servers
+        run: python aggregate/aggregate.py --inventory inventory/hosts.yml --out site
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

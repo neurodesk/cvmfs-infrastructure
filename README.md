@@ -65,6 +65,25 @@ Any change to the report must keep these guarantees. Before merging, generate
 the report and check it, e.g. `grep -E '([0-9]{1,3}\.){3}[0-9]{1,3}'` should
 only match container version numbers.
 
+## Fleet dashboard (GitHub Pages)
+
+`.github/workflows/dashboard.yml` runs daily at 04:30 UTC (and on changes to
+`aggregate/` or the inventory). `aggregate/aggregate.py` fetches every
+inventory host's public `http://<ansible_host>/stats/stats.json`, sums them and
+publishes one dashboard to GitHub Pages: per-server daily opens, data served,
+top tools, continents/regions, all container versions and a server health table.
+
+* Optional host vars: `stats_label` (display name), `stats_url` (override).
+* A server that is down or not yet deployed is shown as *unavailable*; the
+  build only fails if no server reports at all.
+* Privacy: it only reads the already k-anonymous public files. Sums of groups
+  that each have >= k clients still have >= k clients. "Clients" are summed
+  across servers and are therefore an upper bound.
+* Fetched JSON is untrusted input: values are type-checked and all strings are
+  HTML-escaped.
+
+Run locally: `pip install pyyaml && python aggregate/aggregate.py --out site`.
+
 ## Secrets
 
 Never commit plaintext secrets. CI rejects a `vault.yml` that is not

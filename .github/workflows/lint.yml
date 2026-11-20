@@ -11,9 +11,9 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -41,6 +41,9 @@ jobs:
 
       - name: Python syntax (stats script must stay Python 3.9 compatible)
         run: python -m py_compile roles/access_stats/files/cvmfs-access-stats
+
+      - name: Aggregator syntax
+        run: python -m py_compile aggregate/aggregate.py
 
       - name: Playbook syntax
         run: ansible-playbook --syntax-check site.yml
