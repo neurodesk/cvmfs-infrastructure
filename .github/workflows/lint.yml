@@ -30,6 +30,15 @@ jobs:
           done
           exit $fail
 
+      - name: Refuse plaintext passwords outside the vault
+        run: |
+          # literal password values (not Jinja-templated) in tracked files
+          if git ls-files -z -- ':!*vault.yml' ':!*.example' \
+              | xargs -0 grep -nIiE "password[\"']?[[:space:]]*[:=]?[[:space:]]*[\"'][^\"'{]+[\"']"; then
+            echo "::error::plaintext password found; put it in the encrypted vault.yml"
+            exit 1
+          fi
+
       - name: Python syntax (stats script must stay Python 3.9 compatible)
         run: python -m py_compile roles/access_stats/files/cvmfs-access-stats
 
