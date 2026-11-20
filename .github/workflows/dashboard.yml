@@ -23,6 +23,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: read          # configure-pages reads the site settings
     steps:
       - uses: actions/checkout@v7
 
