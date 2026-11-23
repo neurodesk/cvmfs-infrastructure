@@ -504,21 +504,35 @@ tr:last-child td{{border-bottom:0}}.num{{text-align:right;font-variant-numeric:t
 details{{margin-top:8px}}summary{{cursor:pointer;color:var(--fg2);font-size:13px}}details .tw{{margin-top:8px;max-height:420px;overflow:auto}}
 input{{width:100%;max-width:320px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit;margin-bottom:10px}}
 .st.ok{{color:var(--ok)}}.st.stale{{color:var(--warn)}}.st.unavailable{{color:var(--bad)}}
-.hbars{{display:grid;gap:4px}}.hb{{display:grid;grid-template-columns:minmax(90px,190px) 1fr auto;align-items:center;gap:10px;padding:2px 4px;border-radius:6px}}.hb:hover,.hb:focus-visible{{background:var(--grid);outline:none}}.hl{{text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}}.ht{{height:16px;display:block}}.hf{{display:block;height:100%;background:var(--s0);border-radius:0 4px 4px 0}}.hstack{{display:flex;gap:2px;background:none}}.hs{{display:block;height:100%;flex-basis:0;min-width:0}}.hs:first-child{{border-radius:0}}.hs:last-child{{border-radius:0 4px 4px 0}}.hv{{font-size:12px;color:var(--fg2);font-variant-numeric:tabular-nums;white-space:nowrap}}.cw{{overflow-x:auto}}.cw .chart{{min-width:640px}}
+.hbars{{display:grid;gap:4px}}.hb{{display:grid;grid-template-columns:minmax(90px,190px) 1fr auto;align-items:center;gap:10px;padding:2px 4px;border-radius:6px}}.hb:hover,.hb:focus-visible{{background:var(--grid);outline:none}}.hl{{text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}}.ht{{height:16px;display:block}}.hf{{display:block;height:100%;background:var(--s0);border-radius:0 4px 4px 0}}.hstack{{display:flex;gap:2px;background:none}}.hs{{display:block;height:100%;flex-basis:0;min-width:0}}.hs:first-child{{border-radius:0}}.hs:last-child{{border-radius:0 4px 4px 0}}.hv{{font-size:12px;color:var(--fg2);font-variant-numeric:tabular-nums;white-space:nowrap}}.embed-only{{display:none}}.embed .embed-only{{display:block}}.embed .full-only,.embed .read,.embed h1,.embed footer{{display:none}}.embed main{{padding-top:8px;padding-bottom:16px}}.more{{margin-top:24px;font-size:14px}}.read{{margin-top:16px}}.read h3{{font-size:15px;margin:0 0 6px}}.read ul{{margin:0;padding-left:20px;color:var(--fg2);font-size:14px}}.read li+li{{margin-top:4px}}.cw{{overflow-x:auto}}.cw .chart{{min-width:640px}}
 footer{{margin-top:44px;font-size:13px;color:var(--fg2)}}a{{color:var(--s0)}}
 </style></head><body><main>
+<script>if(/[?&]embed=1(&|$)/.test(location.search))document.documentElement.classList.add('embed');</script>
 <h1>Neurodesk CVMFS usage</h1>
 <p class="sub">All Stratum&nbsp;1 servers of <code>neurodesk.ardc.edu.au</code> &middot; data {dfrom} &ndash; {dto} &middot; updated {generated}</p>
 
 <div class="tiles">{tiles}</div>
 
+<div class="card read">
+<h3>How to read these numbers</h3>
+<ul>
+<li><b>Container opens</b> count how often a computer or site cache that did <em>not</em> already have a container
+fetched it from a Stratum&nbsp;1. Running a tool again on the same computer, or on other computers behind the same
+site cache, is usually not counted. So opens show how widely a tool is pulled, not how often it is run.</li>
+<li>Opening a file or binary inside a container is <em>not</em> counted as an open. Those downloads only appear
+in <b>data served</b>.</li>
+<li>Short-lived machines (CI runners, cloud VMs, fresh containers) start with an empty cache and count every time,
+so they can cause spikes. Compare tools and trends with each other rather than reading the totals as users or runs.</li>
+</ul>
+</div>
+
 <h2>Container opens per day</h2>
-<p class="note">Last 90 days, stacked by the Stratum&nbsp;1 server that served them.</p>
+<p class="note">Last 90 days, stacked by the Stratum&nbsp;1 server that served them. One open = one computer or site cache fetching a container it did not have yet.</p>
 <div class="card"><div class="legend">{legend}</div><div class="cw">{opens_chart}</div>
 <details><summary>Show data table</summary>{opens_table}</details></div>
 
 <h2>Data served per day</h2>
-<p class="note">Last 90 days, all object types, stacked by the Stratum&nbsp;1 server that served them.</p>
+<p class="note">Last 90 days, stacked by the Stratum&nbsp;1 server that served them. Counts everything downloaded from the servers: container files and binaries as well as indexes. Files already in a client or site cache are not downloaded again and are not counted.</p>
 <div class="card"><div class="legend">{blegend}</div><div class="cw">{bytes_chart}</div><details><summary>Show data table</summary>{bytes_table}</details></div>
 
 <h2>Most used tools</h2>
@@ -531,6 +545,9 @@ Clients normally use the server closest to them, so the split shows roughly wher
 <p class="note">Data served in the last 30 days.</p>
 <div class="card">{cont_chart}</div>
 
+<p class="embed-only more"><a href="./" target="_blank" rel="noopener">Open the full dashboard</a> for regions, all tools, container versions and per-server status.</p>
+
+<div class="full-only">
 <h2>By region</h2>
 <p class="note">Last 30 days. Regions with fewer than {k} distinct clients on a server are merged into coarser groups.</p>
 {r30}
@@ -547,10 +564,23 @@ Clients normally use the server closest to them, so the split shows roughly wher
 <h2>Servers</h2>
 {servers}
 
+</div>
+
 <h2>Methodology &amp; privacy</h2>
 <div class="card">
-<p><b>Container opens</b> count downloads of a container's file catalog from a Stratum&nbsp;1. Site caches
-keep catalogs, so one open usually stands for many runs at a site: the numbers show reach, not executions.</p>
+<p><b>What is counted.</b> CernVM-FS stores each container with its own file index (a <em>catalog</em>). A client
+has to download that index before it can see any file in the container, so the servers count index downloads,
+per container and country, as <b>container opens</b>. They are counted from each server's access log; nothing on the
+user's machine is measured.</p>
+<p><b>Why an open is not a run.</b> Clients keep downloaded indexes and files in a local cache, and most
+institutions put a shared cache (proxy) in front of all their machines. Once a container is cached there, further
+runs on those machines never reach a Stratum&nbsp;1 and are not counted, so one open can stand for thousands of runs.
+An index is downloaded again only when it drops out of a cache or when a new release changes the container.
+Machines that start with an empty cache every time (CI runners, cloud VMs) count on every start.</p>
+<p><b>Known bias.</b> Some containers keep their image in a second index, so a first open of those can count twice.
+Small differences between tools therefore do not mean much.</p>
+<p><b>Data served</b> and <b>requests</b> count every object downloaded from the servers (indexes and file contents).
+Accessing a binary inside a container shows up here, but only when it is not already cached.</p>
 <p><b>Clients*</b> are distinct client addresses as seen by each server (often site proxies or short-lived
 cloud/CI machines, not individual users), summed across servers &mdash; an upper bound, since a client
 may use more than one server.</p>
@@ -574,6 +604,11 @@ g.addEventListener('mousemove',function(ev){{show(g,ev.clientX,ev.clientY);}});
 g.addEventListener('mouseleave',function(){{tip.style.display='none';}});
 g.addEventListener('focus',function(){{var b=g.getBoundingClientRect();show(g,b.left+b.width/2,b.top);}});
 g.addEventListener('blur',function(){{tip.style.display='none';}});}});
+if(window.parent!==window){{   // embedded (e.g. neurodesk.org): report height so the frame can fit it
+var last=0;function post(){{var h=Math.ceil(document.body.getBoundingClientRect().height);
+if(h!==last){{last=h;window.parent.postMessage({{type:'cvmfs-dashboard:height',height:h}},'*');}}}}
+if(window.ResizeObserver)new ResizeObserver(post).observe(document.body);
+addEventListener('load',post);addEventListener('resize',post);post();}}
 var q=document.getElementById('q'),t=document.querySelector('table.filterable');
 if(q&&t){{var rows=t.querySelectorAll('tbody tr');q.addEventListener('input',function(){{
 var v=q.value.toLowerCase();rows.forEach(function(r){{r.style.display=r.cells[0].textContent.toLowerCase().indexOf(v)>=0?'':'none';}});}});}}
