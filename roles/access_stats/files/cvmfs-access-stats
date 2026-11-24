@@ -9,6 +9,15 @@ How it works
     front of it) must download that catalog to open the container, so
     catalog downloads (URLs ending in "C") are a cheap, accurate proxy for
     "container X was opened from network Y".
+  * Many containers have a second catalog for the unpacked image directly
+    below the container catalog (/containers/<c>/<c>.simg), and large images
+    are split further below that (.../<c>.simg/usr, ...).  To count each open
+    exactly once, exactly one catalog per container is the "open" catalog:
+    the image catalog directly below the container catalog if there is one,
+    otherwise the container catalog itself.  Deeper catalogs never count, and
+    downloading only the outer catalog of a split container (e.g. listing its
+    directory) is not an open.  Applied from the day recorded as
+    'opens_rule_since' in stats.json; earlier days may count some opens twice.
   * Catalog hashes are mapped to paths by reading only the requested catalog
     objects from local disk (their 'root_prefix' property); cached by hash.
   * The squid access log is parsed incrementally (watermark on timestamp).
@@ -56,7 +65,8 @@ INDEX = "(repository index)"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
-CREATE TABLE IF NOT EXISTS catalogs (hash TEXT PRIMARY KEY, path TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS catalogs (hash TEXT PRIMARY KEY, path TEXT NOT NULL,
+                                     direct_child INTEGER);
 CREATE TABLE IF NOT EXISTS countries (code TEXT PRIMARY KEY, name TEXT, continent TEXT);
 -- aggregates (kept forever, contain no client identifiers)
 CREATE TABLE IF NOT EXISTS fetches (
@@ -80,6 +90,8 @@ def open_state(state_dir):
     os.chmod(state_dir, 0o700)
     db = sqlite3.connect(os.path.join(state_dir, "state.db"))
     db.executescript(SCHEMA)
+    if "direct_child" not in [r[1] for r in db.execute("PRAGMA table_info(catalogs)")]:
+        db.execute("ALTER TABLE catalogs ADD COLUMN direct_child INTEGER")  # older state dbs
     os.chmod(os.path.join(state_dir, "state.db"), 0o600)
     return db
 
@@ -106,26 +118,34 @@ def get_secret(state_dir):
 # ---------------------------------------------------------- catalog mapping --
 
 class CatalogResolver:
-    """Map catalog hash -> repository path, lazily and only for catalogs that
-    clients actually requested.  Each catalog records its own path in the
-    'root_prefix' property, so old/orphaned revisions resolve too.  Results
-    are cached in the state db (catalogs are immutable by hash)."""
+    """Map catalog hash -> (repository path, has a nested catalog directly
+    below it), lazily and only for catalogs that clients actually requested.
+    Each catalog records its own path in the 'root_prefix' property, so
+    old/orphaned revisions resolve too.  Results are cached in the state db
+    (catalogs are immutable by hash)."""
 
     def __init__(self, db, repo_dir, tmpdir):
         self.db = db
         self.repo_dir = repo_dir
         self.tmpdir = tmpdir
-        self.cache = dict(db.execute("SELECT hash, path FROM catalogs"))
+        self.cache = {h: (p, dc) for h, p, dc in
+                      db.execute("SELECT hash, path, direct_child FROM catalogs")}
         self.new = 0
 
-    def path(self, h):
-        p = self.cache.get(h)
-        if p is None:
-            p = self._resolve(h)
-            self.cache[h] = p
-            self.db.execute("INSERT OR REPLACE INTO catalogs VALUES (?,?)", (h, p))
+    def info(self, h):
+        """(path, has_direct_child); path is None if the catalog is unreadable."""
+        p, dc = self.cache.get(h, (None, None))
+        if p is None or dc is None:          # unknown, or cached by an older version
+            p2, dc = self._resolve(h)
+            if p is None or p2 != "?":
+                p = p2
+            if dc is None:                   # object gone: assume unsplit
+                dc = 0
+            self.cache[h] = (p, dc)
+            self.db.execute("INSERT OR REPLACE INTO catalogs VALUES (?,?,?)",
+                            (h, p, dc))
             self.new += 1
-        return p if p != "?" else None
+        return (p if p != "?" else None), bool(dc)
 
     def _resolve(self, h):
         obj = os.path.join(self.repo_dir, "data", h[:2], h[2:] + "C")
@@ -133,7 +153,7 @@ class CatalogResolver:
             with open(obj, "rb") as f:
                 raw = zlib.decompress(f.read())
         except (OSError, zlib.error):
-            return "?"                       # missing / garbage collected
+            return "?", None                 # missing / garbage collected
         fd, tmp = tempfile.mkstemp(dir=self.tmpdir, suffix=".db")
         try:
             with os.fdopen(fd, "wb") as f:
@@ -144,12 +164,27 @@ class CatalogResolver:
                                  "WHERE key='root_prefix'").fetchone()
             except sqlite3.Error:
                 r = None
+            path = "" if r is None or r[0] == "/" else r[0]   # root has no prefix
+            try:
+                kids = [k for k, in conn.execute("SELECT path FROM nested_catalogs")]
+            except sqlite3.Error:
+                kids = []
             conn.close()
-            if r is None:
-                return ""                    # root catalog has no prefix
-            return r[0] if r[0] != "/" else ""
+            depth = path.count("/")
+            dc = int(any(k.count("/") == depth + 1 for k in kids))
+            return path, dc
         finally:
             os.unlink(tmp)
+
+
+def is_open_catalog(path, has_direct_child):
+    """Exactly one catalog per container counts as an open (see module doc):
+    the catalog directly below the container catalog, or the container
+    catalog itself when nothing is directly below it."""
+    depth = len(path.strip("/").split("/"))
+    if depth == 2:                           # /containers/<c>
+        return not has_direct_child
+    return depth == 3                        # /containers/<c>/<c>.simg
 
 
 def container_of(path):
@@ -227,7 +262,10 @@ def parse_logs(db, args, secret, log):
                         % re.escape(args.repo))
     repo_marker = "/cvmfs/%s/" % args.repo
     nethash = {}
-    unmapped = 0
+    unmapped = skipped = 0
+    if meta_get(db, "opens_rule_since") is None:
+        meta_set(db, "opens_rule_since",
+                 time.strftime("%Y-%m-%d", time.gmtime()))
     new_wm = watermark
     total = 0
 
@@ -274,11 +312,14 @@ def parse_logs(db, args, secret, log):
                 seen_a.add((day, country, net))
                 m = cat_re.search(url)
                 if m:
-                    cpath = catalogs.path(m.group(1) + m.group(2))
+                    cpath, dchild = catalogs.info(m.group(1) + m.group(2))
                     if cpath is None:
                         unmapped += 1
                         continue
                     cont = container_of(cpath)
+                    if cont != INDEX and not is_open_catalog(cpath, dchild):
+                        skipped += 1     # outer or deeper catalog of a split container
+                        continue
                     k = (day, cont, country)
                     fetches[k] = fetches.get(k, 0) + 1
                     seen_c.add((day, cont, country, net))
@@ -302,7 +343,8 @@ def parse_logs(db, args, secret, log):
     nethash.clear()
     os.rmdir(tmpdir)
     log("parsed %d new requests; resolved %d new catalogs; "
-        "%d catalog fetches unresolvable" % (total, catalogs.new, unmapped))
+        "%d catalog fetches unresolvable; %d outer/deeper catalog fetches not counted"
+        % (total, catalogs.new, unmapped, skipped))
 
 
 def purge(db, retention_days):
@@ -503,6 +545,8 @@ class Report:
             "generated": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
             "data_from": first, "data_to": last,
             "min_networks_per_group": self.k,
+            "opens_rule": "one-catalog-per-container",
+            "opens_rule_since": meta_get(self.db, "opens_rule_since"),
             "distinct_window_limit_days": retention,
             "daily": self.daily(180),
             "continents_30d": self.continents(30),
@@ -668,7 +712,8 @@ footer{margin-top:40px;font-size:13px;color:var(--muted)}a{color:var(--accent)}
 <h2>Methodology &amp; privacy</h2>
 <div class="card">
 <p><b>Container opens</b> count downloads of a container's file catalog from this
-server. Clients and site caches (squid proxies) keep catalogs locally, so one
+server (for containers whose image has its own catalog, only the image catalog
+is counted, so each open counts once). Clients and site caches (squid proxies) keep catalogs locally, so one
 &ldquo;open&rdquo; usually stands for many runs at a site; numbers indicate
 reach, not total executions. Traffic served by other Stratum&nbsp;1 servers is not included.</p>
 <p><b>Clients</b> are distinct client addresses as seen by this server (counted via salted hashes). These

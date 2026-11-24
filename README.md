@@ -42,10 +42,16 @@ snapshot in the background (this can take many hours).
 ## Usage statistics (`roles/access_stats`)
 
 `cvmfs-access-stats` runs nightly from a systemd timer (idle CPU/IO priority,
-sandboxed). It parses squid's access log incrementally and counts downloads of
-each container's nested catalog (`/containers/<tool>_<version>_<date>`) as a
-"container open". Catalog hashes are resolved from the `root_prefix` property of
-the catalog objects on local disk.
+sandboxed). It parses squid's access log incrementally and counts catalog
+downloads as "container opens", exactly one catalog per container: the image
+catalog directly below the container catalog
+(`/containers/<c>/<c>.simg`) when the container has one, otherwise the
+container catalog (`/containers/<c>`) itself. Deeper catalogs (large images
+are split further) and the outer catalog of split containers are not counted,
+so each open counts once. This rule applies from `opens_rule_since` in
+`stats.json`; earlier data counted every catalog of a container and can count
+one open several times. Catalog paths are resolved from the `root_prefix`
+property of the catalog objects on local disk.
 
 Privacy guarantees of the published page (`/stats/index.html`, `/stats/stats.json`):
 
