@@ -1,4 +1,4 @@
-# {{ ansible_managed }}
+# Managed by Ansible (neurodesk/cvmfs-infrastructure roles/common)
 {% if monit_smtp_password %}
 set mailserver {{ monit_smtp_server }} port {{ monit_smtp_port }}
     username "{{ monit_smtp_user }}"

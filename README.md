@@ -35,6 +35,21 @@ ansible-playbook site.yml --limit stratum1-brisbane --ask-vault-pass
 ansible-playbook site.yml --tags access_stats --ask-vault-pass
 ```
 
+Server-specific notes:
+
+* **Toronto** only accepts SSH through a jump host. Use an SSH config alias
+  with `ProxyJump` (e.g. `cvmfs_1stratum1_toronto`) and point Ansible at it:
+  `ansible-playbook site.yml --limit stratum1-toronto -e ansible_host=cvmfs_1stratum1_toronto --ask-vault-pass`.
+* **Frankfurt** runs CentOS Stream 8 with Python 3.6. ansible-core 2.16 is the
+  last series that manages Python 3.6 hosts, so use
+  `pip install 'ansible-core==2.16.*'` (on a Python 3.10–3.12 controller; CI
+  pins the same series) (and add
+  `--private-key` with its AWS key). The stats script must stay Python 3.6
+  compatible while Frankfurt is on 3.6.
+* If SSH reports "Host key verification failed" for a server you know, your
+  `known_hosts` may list it by IP address only; check the key against that entry
+  before adding the host name.
+
 Adding a new Stratum 1: add it to `inventory/hosts.yml` and run the playbook
 for that host. The first run creates the replica and starts the initial
 snapshot in the background (this can take many hours).
