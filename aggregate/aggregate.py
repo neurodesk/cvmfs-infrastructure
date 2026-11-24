@@ -20,6 +20,7 @@ import argparse
 import datetime as dt
 import html
 import json
+import math
 import os
 import sys
 import urllib.request
@@ -70,7 +71,7 @@ def num(v):
     """Non-negative int from untrusted input."""
     if isinstance(v, bool):
         return 0
-    if isinstance(v, (int, float)):
+    if isinstance(v, int) or (isinstance(v, float) and math.isfinite(v)):
         return max(int(v), 0)
     return 0
 
@@ -504,24 +505,25 @@ tr:last-child td{{border-bottom:0}}.num{{text-align:right;font-variant-numeric:t
 details{{margin-top:8px}}summary{{cursor:pointer;color:var(--fg2);font-size:13px}}details .tw{{margin-top:8px;max-height:420px;overflow:auto}}
 input{{width:100%;max-width:320px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit;margin-bottom:10px}}
 .st.ok{{color:var(--ok)}}.st.stale{{color:var(--warn)}}.st.unavailable{{color:var(--bad)}}
-.hbars{{display:grid;gap:4px}}.hb{{display:grid;grid-template-columns:minmax(90px,190px) 1fr auto;align-items:center;gap:10px;padding:2px 4px;border-radius:6px}}.hb:hover,.hb:focus-visible{{background:var(--grid);outline:none}}.hl{{text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}}.ht{{height:16px;display:block}}.hf{{display:block;height:100%;background:var(--s0);border-radius:0 4px 4px 0}}.hstack{{display:flex;gap:2px;background:none}}.hs{{display:block;height:100%;flex-basis:0;min-width:0}}.hs:first-child{{border-radius:0}}.hs:last-child{{border-radius:0 4px 4px 0}}.hv{{font-size:12px;color:var(--fg2);font-variant-numeric:tabular-nums;white-space:nowrap}}.embed-only{{display:none}}.embed .embed-only{{display:block}}.embed .full-only,.embed .read,.embed h1,.embed footer{{display:none}}.embed main{{padding-top:8px;padding-bottom:16px}}.more{{margin-top:24px;font-size:14px}}.read{{margin-top:16px}}.read h3{{font-size:15px;margin:0 0 6px}}.read ul{{margin:0;padding-left:20px;color:var(--fg2);font-size:14px}}.read li+li{{margin-top:4px}}.cw{{overflow-x:auto}}.cw .chart{{min-width:640px}}
+.hbars{{display:grid;gap:4px}}.hb{{display:grid;grid-template-columns:minmax(90px,190px) 1fr auto;align-items:center;gap:10px;padding:2px 4px;border-radius:6px}}.hb:hover,.hb:focus-visible{{background:var(--grid);outline:none}}.hl{{text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}}.ht{{height:16px;display:block}}.hf{{display:block;height:100%;background:var(--s0);border-radius:0 4px 4px 0}}.hstack{{display:flex;gap:2px;background:none}}.hs{{display:block;height:100%;flex-basis:0;min-width:0}}.hs:first-child{{border-radius:0}}.hs:last-child{{border-radius:0 4px 4px 0}}.hv{{font-size:12px;color:var(--fg2);font-variant-numeric:tabular-nums;white-space:nowrap}}.embed-only{{display:none}}.embed .embed-only{{display:block}}.embed .full-only,.embed .read,.embed h1,.embed footer{{display:none}}.embed main{{padding-top:8px;padding-bottom:16px}}.more{{margin-top:24px;font-size:14px}}.read{{margin-top:16px}}.read h2{{font-size:15px;margin:0 0 6px}}.read ul{{margin:0;padding-left:20px;color:var(--fg2);font-size:14px}}.read li+li{{margin-top:4px}}.cw{{overflow-x:auto}}.cw .chart{{min-width:640px}}
 footer{{margin-top:44px;font-size:13px;color:var(--fg2)}}a{{color:var(--s0)}}
-</style></head><body><main>
+</style>
 <script>if(/[?&]embed=1(&|$)/.test(location.search))document.documentElement.classList.add('embed');</script>
+</head><body><main>
 <h1>Neurodesk CVMFS usage</h1>
 <p class="sub">All Stratum&nbsp;1 servers of <code>neurodesk.ardc.edu.au</code> &middot; data {dfrom} &ndash; {dto} &middot; updated {generated}</p>
 
 <div class="tiles">{tiles}</div>
 
 <div class="card read">
-<h3>How to read these numbers</h3>
+<h2>How to read these numbers</h2>
 <ul>
 <li><b>Container opens</b> count how often a computer or site cache that did <em>not</em> already have a container
 fetched it from a Stratum&nbsp;1. Running a tool again on the same computer, or on other computers behind the same
 site cache, is usually not counted. So opens show how widely a tool is pulled, not how often it is run.</li>
-<li>Opening a file or binary inside a container is <em>not</em> counted as an open. Those downloads only appear
-in <b>data served</b>.</li>
-<li>Short-lived machines (CI runners, cloud VMs, fresh containers) start with an empty cache and count every time,
+<li>Using files or binaries inside a container that is already loaded does <em>not</em> add opens. Those downloads
+only appear in <b>data served</b> and <b>requests</b>.</li>
+<li>Short-lived machines (CI runners, cloud VMs, ephemeral runtime environments) start with an empty cache and count every time they load a container,
 so they can cause spikes. Compare tools and trends with each other rather than reading the totals as users or runs.</li>
 </ul>
 </div>
@@ -577,14 +579,16 @@ institutions put a shared cache (proxy) in front of all their machines. Once a c
 runs on those machines never reach a Stratum&nbsp;1 and are not counted, so one open can stand for thousands of runs.
 An index is downloaded again only when it drops out of a cache or when a new release changes the container.
 Machines that start with an empty cache every time (CI runners, cloud VMs) count on every start.</p>
-<p><b>Known bias.</b> Some containers keep their image in a second index, so a first open of those can count twice.
-Small differences between tools therefore do not mean much.</p>
+<p><b>Known bias.</b> Some containers keep their image in a second index. Servers running the older counter count a
+first open of those twice; servers whose <code>stats.json</code> reports <code>opens_rule</code>
+&ldquo;one-catalog-per-container&rdquo; count it once from <code>opens_rule_since</code> on. Small differences between
+tools therefore do not mean much.</p>
 <p><b>Data served</b> and <b>requests</b> count every object downloaded from the servers (indexes and file contents).
 Accessing a binary inside a container shows up here, but only when it is not already cached.</p>
-<p><b>Clients*</b> are distinct client addresses as seen by each server (often site proxies or short-lived
+<p class="full-only"><b>Clients*</b> are distinct client addresses as seen by each server (often site proxies or short-lived
 cloud/CI machines, not individual users), summed across servers &mdash; an upper bound, since a client
 may use more than one server.</p>
-<p><b>Privacy:</b> servers never store or publish IP addresses, host names or cities. Each server publishes only
+<p><b>Privacy.</b> Servers never store or publish IP addresses, host names or cities. Each server publishes only
 continent/country aggregates in which every group has at least {k} distinct clients; this dashboard only sums
 those published files.</p>
 </div>
@@ -606,7 +610,7 @@ g.addEventListener('focus',function(){{var b=g.getBoundingClientRect();show(g,b.
 g.addEventListener('blur',function(){{tip.style.display='none';}});}});
 if(window.parent!==window){{   // embedded (e.g. neurodesk.org): report height so the frame can fit it
 var last=0;function post(){{var h=Math.ceil(document.body.getBoundingClientRect().height);
-if(h!==last){{last=h;window.parent.postMessage({{type:'cvmfs-dashboard:height',height:h}},'*');}}}}
+if(h>0&&h!==last){{last=h;window.parent.postMessage({{type:'cvmfs-dashboard:height',height:h}},'*');}}}}
 if(window.ResizeObserver)new ResizeObserver(post).observe(document.body);
 addEventListener('load',post);addEventListener('resize',post);post();}}
 var q=document.getElementById('q'),t=document.querySelector('table.filterable');
