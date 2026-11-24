@@ -1,4 +1,4 @@
-# {{ ansible_managed }}
+# Managed by Ansible (neurodesk/cvmfs-infrastructure roles/squid)
 {% for port in squid_http_ports %}
 http_port {{ port }} accel
 {% endfor %}
