@@ -54,7 +54,7 @@
     dest: /etc/cron.d/cvmfs_stratum1_gc
     content: |
       # Run CVMFS Stratum 1 garbage collection weekly
-      {{ cvmfs_gc_schedule }} root /usr/bin/cvmfs_server gc -a >> /var/log/cvmfs_gc.log 2>&1
+      {{ cvmfs_gc_schedule }} root /usr/bin/cvmfs_server gc -af >> /var/log/cvmfs_gc.log 2>&1
     mode: "0644"
 
 - name: Remove legacy GC entry from root's crontab (now in /etc/cron.d)
